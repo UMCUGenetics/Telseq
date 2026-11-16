@@ -1,3 +1,4 @@
+
 """Scan parameters and constants for TelSeq."""
 
 from typing import Final
@@ -26,18 +27,19 @@ GC_LOWERBOUND: Final[float] = 0.4
 GC_UPPERBOUND: Final[float] = 0.6
 GC_BINSIZE: Final[float] = 0.02
 
-# Telomeric GC content bounds (for telomere length estimation)
+# Telomeric GC content bounds
 GC_TELOMERIC_LOWERBOUND: Final[float] = 0.48
 GC_TELOMERIC_UPPERBOUND: Final[float] = 0.52
 
-# Maximum motif counts - calculated dynamically based on read length
-# Add 1 to include 0 count
+# Minimum number of telomere repeats for a read to be considered telomeric
 TEL_MOTIF_CUTOFF: Final[int] = 7
 
 # Number of GC bins
-GC_BIN_N: Final[int] = int((GC_UPPERBOUND - GC_LOWERBOUND) / GC_BINSIZE + 0.5)
+GC_BIN_N: Final[int] = int(
+    (GC_UPPERBOUND - GC_LOWERBOUND) / GC_BINSIZE + 0.5
+)
 
-# Maximum motif counts - will be calculated based on read length
+# Number of motif-count bins, including bin zero
 TEL_MOTIF_N: int = READ_LENGTH // len(PATTERN) + 1
 
 # Output labels
@@ -52,20 +54,6 @@ LABEL_GC: Final[str] = "GC"
 LABEL_LEN: Final[str] = "LENGTH_ESTIMATE"
 
 
-def update_parameters(read_length: int | None = None, pattern: str | None = None) -> None:
-    """Update parameters based on read length and pattern."""
-    global READ_LENGTH, PATTERN, PATTERN_REVCOMP, TEL_MOTIF_N
-
-    if read_length is not None:
-        READ_LENGTH = read_length
-    if pattern is not None:
-        PATTERN = pattern
-        PATTERN_REVCOMP = reverse_complement(pattern)
-
-    # Update total motif counts
-    TEL_MOTIF_N = READ_LENGTH // len(PATTERN) + 1
-
-
 def reverse_complement(seq: str) -> str:
     """Return the reverse complement of a DNA sequence."""
     complement_map = {
@@ -75,4 +63,43 @@ def reverse_complement(seq: str) -> str:
         "T": "A",
         "N": "N",
     }
-    return "".join(complement_map.get(base, "N") for base in reversed(seq))
+
+    seq = seq.upper()
+
+    invalid_bases = set(seq) - set(complement_map)
+    if invalid_bases:
+        raise ValueError(
+            f"Invalid DNA bases in motif: {sorted(invalid_bases)}"
+        )
+
+    return "".join(complement_map[base] for base in reversed(seq))
+
+
+def update_parameters(
+    read_length: int | None = None,
+    pattern: str | None = None,
+) -> None:
+    """Update parameters based on read length and motif pattern."""
+    global READ_LENGTH
+    global PATTERN
+    global PATTERN_REVCOMP
+    global TEL_MOTIF_N
+
+    if read_length is not None:
+        if read_length <= 0:
+            raise ValueError("Read length must be greater than zero.")
+        READ_LENGTH = read_length
+
+    if pattern is not None:
+        pattern = pattern.upper()
+
+        if not pattern:
+            raise ValueError("The motif pattern cannot be empty.")
+
+        PATTERN = pattern
+        PATTERN_REVCOMP = reverse_complement(pattern)
+
+    if not PATTERN:
+        raise ValueError("The motif pattern cannot be empty.")
+
+    TEL_MOTIF_N = READ_LENGTH // len(PATTERN) + 1

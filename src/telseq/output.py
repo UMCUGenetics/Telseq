@@ -1,23 +1,12 @@
+
 """Output formatting for TelSeq."""
 
 import sys
 from typing import TYPE_CHECKING, Dict, List, TextIO
 
+from telseq import parameters
 from telseq.models import ScanResults
-from telseq.parameters import (
-    FIELD_SEP,
-    GC_BIN_N,
-    LABEL_DUP,
-    LABEL_GC,
-    LABEL_LEN,
-    LABEL_LB,
-    LABEL_MAPPED,
-    LABEL_RG,
-    LABEL_SAMPLE,
-    LABEL_TEL,
-    LABEL_TOTAL,
-    TEL_MOTIF_N,
-)
+from telseq.utils import create_writer
 
 if TYPE_CHECKING:
     from telseq.scanner import Scanner
@@ -29,145 +18,229 @@ class Headers:
     def __init__(self) -> None:
         self.headers = self._generate_headers()
 
-    def _generate_headers(self) -> List[str]:
-        """Generate output headers."""
+    @staticmethod
+    def _generate_headers() -> List[str]:
+        """Generate output headers using the active parameters."""
         headers = [
-            LABEL_RG,
-            LABEL_LB,
-            LABEL_SAMPLE,
-            LABEL_TOTAL,
-            LABEL_MAPPED,
-            LABEL_DUP,
-            LABEL_LEN,
+            parameters.LABEL_RG,
+            parameters.LABEL_LB,
+            parameters.LABEL_SAMPLE,
+            parameters.LABEL_TOTAL,
+            parameters.LABEL_MAPPED,
+            parameters.LABEL_DUP,
+            parameters.LABEL_LEN,
         ]
-        for i in range(TEL_MOTIF_N):
-            headers.append(f"{LABEL_TEL}{i}")
-        for i in range(GC_BIN_N):
-            headers.append(f"{LABEL_GC}{i}")
+
+        for index in range(parameters.TEL_MOTIF_N):
+            headers.append(f"{parameters.LABEL_TEL}{index}")
+
+        for index in range(parameters.GC_BIN_N):
+            headers.append(f"{parameters.LABEL_GC}{index}")
+
         return headers
 
 
-def _get_scanner() -> "Scanner":
-    """Lazy import of Scanner."""
-    from telseq.scanner import Scanner
-    return Scanner([], tel_k=7)  # Default tel_k
-
-
-def printout(rg: str, result: ScanResults, writer: TextIO) -> None:
+def printout(
+    rg: str,
+    result: ScanResults,
+    writer: TextIO,
+    scanner: "Scanner",
+) -> None:
     """Print a single result line."""
-    writer.write(f"{rg}{FIELD_SEP}")
-    writer.write(f"{result.lib}{FIELD_SEP}")
-    writer.write(f"{result.sample}{FIELD_SEP}")
-    writer.write(f"{result.numTotal}{FIELD_SEP}")
-    writer.write(f"{result.numMapped}{FIELD_SEP}")
-    writer.write(f"{result.numDuplicates}{FIELD_SEP}")
+    writer.write(f"{rg}{parameters.FIELD_SEP}")
+    writer.write(f"{result.lib}{parameters.FIELD_SEP}")
+    writer.write(f"{result.sample}{parameters.FIELD_SEP}")
+    writer.write(f"{result.numTotal}{parameters.FIELD_SEP}")
+    writer.write(f"{result.numMapped}{parameters.FIELD_SEP}")
+    writer.write(f"{result.numDuplicates}{parameters.FIELD_SEP}")
 
-    # Calculate telomere length
-    scanner = _get_scanner()
     result.telLenEstimate = scanner.calc_tel_length(result)
 
     if result.telLenEstimate == -1:
-        print("Telomere length estimate unknown. No read was found with telomeric GC composition.", file=sys.stderr)
-        writer.write(f"UNKNOWN{FIELD_SEP}")
-    elif result.telLenEstimate > 1000000:
-        print("Telomere length estimate unknown. Possibly due to not enough representation of genome.", file=sys.stderr)
-        writer.write(f"UNKNOWN{FIELD_SEP}")
+        print(
+            "Telomere length estimate unknown. "
+            "No read was found with telomeric GC composition.",
+            file=sys.stderr,
+        )
+        writer.write(f"UNKNOWN{parameters.FIELD_SEP}")
+
+    elif result.telLenEstimate > 1_000_000:
+        print(
+            "Telomere length estimate unknown. "
+            "Possibly due to not enough representation of genome.",
+            file=sys.stderr,
+        )
+        writer.write(f"UNKNOWN{parameters.FIELD_SEP}")
+
     elif result.telLenEstimate == 0:
-        print(f"Telomere length estimate unknown. No read contains more than 7 telomere repeats.", file=sys.stderr)
-        writer.write(f"UNKNOWN{FIELD_SEP}")
+        print(
+            "Telomere length estimate unknown. "
+            f"No read contains at least {scanner.tel_k} "
+            "telomere repeats.",
+            file=sys.stderr,
+        )
+        writer.write(f"UNKNOWN{parameters.FIELD_SEP}")
+
     else:
-        writer.write(f"{result.telLenEstimate}{FIELD_SEP}")
+        writer.write(
+            f"{result.telLenEstimate}{parameters.FIELD_SEP}"
+        )
 
     for count in result.telcounts:
-        writer.write(f"{count}{FIELD_SEP}")
+        writer.write(f"{count}{parameters.FIELD_SEP}")
+
     for count in result.gccounts:
-        writer.write(f"{count}{FIELD_SEP}")
+        writer.write(f"{count}{parameters.FIELD_SEP}")
+
     writer.write("\n")
+
+
+def _merge_read_groups(
+    resultmap: Dict[str, ScanResults],
+) -> tuple[str, ScanResults]:
+    """
+    Merge read groups using a weighted average.
+
+    The weight for each read group is its numTotal value.
+    This preserves the original C++ output behavior.
+    """
+    mergedrs = ScanResults()
+    mergedrs.set_defaults()
+
+    group_names = "|".join(resultmap)
+
+    total_weight = sum(
+        result.numTotal for result in resultmap.values()
+    )
+
+    if not resultmap:
+        return group_names, mergedrs
+
+    if total_weight == 0:
+        mergedrs.sample = next(
+            iter(resultmap.values())
+        ).sample
+        return group_names, mergedrs
+
+    number_of_groups = len(resultmap)
+
+    weighted_mapped = 0.0
+    weighted_duplicates = 0.0
+
+    weighted_telcounts = [
+        0.0
+    ] * len(mergedrs.telcounts)
+
+    weighted_gccounts = [
+        0.0
+    ] * len(mergedrs.gccounts)
+
+    for result in resultmap.values():
+        weight = result.numTotal
+
+        mergedrs.sample = result.sample
+
+        weighted_mapped += result.numMapped * weight
+        weighted_duplicates += result.numDuplicates * weight
+
+        if len(result.telcounts) != len(weighted_telcounts):
+            raise ValueError(
+                "Cannot merge read groups with different motif-bin sizes."
+            )
+
+        if len(result.gccounts) != len(weighted_gccounts):
+            raise ValueError(
+                "Cannot merge read groups with different GC-bin sizes."
+            )
+
+        for index, count in enumerate(result.telcounts):
+            weighted_telcounts[index] += count * weight
+
+        for index, count in enumerate(result.gccounts):
+            weighted_gccounts[index] += count * weight
+
+    mergedrs.numTotal = total_weight / number_of_groups
+    mergedrs.numMapped = weighted_mapped / total_weight
+    mergedrs.numDuplicates = weighted_duplicates / total_weight
+
+    mergedrs.telcounts = [
+        count / total_weight
+        for count in weighted_telcounts
+    ]
+
+    mergedrs.gccounts = [
+        count / total_weight
+        for count in weighted_gccounts
+    ]
+
+    return group_names, mergedrs
 
 
 def output_results(
     resultlist: List[Dict[str, ScanResults]],
+    scanner: "Scanner",
     output_file: str = "",
     writerheader: bool = True,
     mergerg: bool = False,
 ) -> None:
-    """Output results to file or stdout."""
-    # Determine output stream
+    """Output results to a file or stdout."""
     if output_file:
-        writer: TextIO = open(output_file, "w")
-        tostdout = False
+        writer = create_writer(output_file)
+        close_writer = True
     else:
         writer = sys.stdout
-        tostdout = True
+        close_writer = False
 
     try:
         if writerheader:
-            hd = Headers()
-            writer.write(FIELD_SEP.join(hd.headers) + "\n")
+            headers = Headers()
+            writer.write(
+                parameters.FIELD_SEP.join(headers.headers) + "\n"
+            )
 
-        mergedrs: ScanResults
-        grpnames: str = ""
+        for resultmap in resultlist:
+            if not resultmap:
+                continue
 
-        for i in range(len(resultlist)):
-            resultmap = resultlist[i]
+            # Merge read groups within this BAM only.
+            if mergerg and len(resultmap) > 1:
+                group_names, mergedrs = _merge_read_groups(resultmap)
 
-            # If merge read groups, take weighted average for all measures
-            domg = mergerg and len(resultmap) > 1
+                printout(
+                    group_names,
+                    mergedrs,
+                    writer,
+                    scanner,
+                )
 
-            if domg:
-                mergedrs = ScanResults()
-                mergedrs.set_defaults()
-
-            for rg, result in resultmap.items():
-                if domg:
-                    if len(grpnames) == 0:
-                        grpnames = rg
-                    else:
-                        grpnames += "|" + rg
-
-                    mergedrs.sample = result.sample
-                    mergedrs.numTotal += result.numTotal
-                    mergedrs.numMapped += result.numMapped * result.numTotal
-                    mergedrs.numDuplicates += result.numDuplicates * result.numTotal
-
-                    scanner = _get_scanner()
-                    tel_len = scanner.calc_tel_length(result)
-                    mergedrs.telLenEstimate += tel_len * result.numTotal
-
-                    for j in range(min(len(mergedrs.telcounts), len(result.telcounts))):
-                        mergedrs.telcounts[j] += result.telcounts[j] * result.numTotal
-                    for k in range(min(len(mergedrs.gccounts), len(result.gccounts))):
-                        mergedrs.gccounts[k] += result.gccounts[k] * result.numTotal
-                    continue
-                else:
-                    printout(rg, result, writer)
-
-            # In this case calculate weighted average
-            if domg:
-                if mergedrs.numTotal > 0:
-                    mergedrs.numMapped /= mergedrs.numTotal
-                    mergedrs.numDuplicates /= mergedrs.numTotal
-                    mergedrs.telLenEstimate /= mergedrs.numTotal
-
-                    for j in range(len(mergedrs.telcounts)):
-                        mergedrs.telcounts[j] /= mergedrs.numTotal
-                    for k in range(len(mergedrs.gccounts)):
-                        mergedrs.gccounts[k] /= mergedrs.numTotal
-
-                    mergedrs.numTotal /= len(resultmap)
-
-                printout(grpnames, mergedrs, writer)
+            else:
+                for rg, result in resultmap.items():
+                    printout(
+                        rg,
+                        result,
+                        writer,
+                        scanner,
+                    )
 
     finally:
-        if not tostdout:
+        if close_writer:
             writer.close()
 
 
-def printlog(resultlist: List[Dict[str, ScanResults]]) -> None:
-    """Print log information."""
-    for i in range(len(resultlist)):
-        rmap = resultlist[i]
-        for rg, result in rmap.items():
+def printlog(
+    resultlist: List[Dict[str, ScanResults]],
+) -> None:
+    """Print exome filtering statistics."""
+    for resultmap in resultlist:
+        for rg, result in resultmap.items():
             print(f"BAM:{rg}", file=sys.stderr)
-            print(f"\tchr ID unmatched reads: {result.n_exreadsChrUnmatched}", file=sys.stderr)
-            print(f"\texome reads excluded: {result.n_exreadsExcluded}", file=sys.stderr)
+            print(
+                f"\tchr ID unmatched reads: "
+                f"{result.n_exreadsChrUnmatched}",
+                file=sys.stderr,
+            )
+            print(
+                f"\texome reads excluded: "
+                f"{result.n_exreadsExcluded}",
+                file=sys.stderr,
+            )

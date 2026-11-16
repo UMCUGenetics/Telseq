@@ -1,61 +1,42 @@
+
 """Core scanning logic for TelSeq."""
 
-from typing import TYPE_CHECKING, Dict, List, Optional
 import sys
+from bisect import bisect_left
+from typing import Any, Dict, List, Optional, Tuple
 
-if TYPE_CHECKING:
-    import pysam
-    HAS_PYSAM = True
-else:
-    pysam = None
-    HAS_PYSAM = False
-
+from telseq import parameters
 from telseq.models import Range, ScanResults, StringVector
-from telseq.parameters import (
-    GC_BINSIZE,
-    GC_LOWERBOUND,
-    GC_TELOMERIC_LOWERBOUND,
-    GC_TELOMERIC_UPPERBOUND,
-    GC_UPPERBOUND,
-    GENOME_LENGTH_AT_TEL_GC,
-    LENGTH_UNIT,
-    PATTERN,
-    PATTERN_REVCOMP,
-    TEL_MOTIF_CUTOFF,
-    TEL_MOTIF_N,
-    TELOMERE_ENDS,
-)
-from telseq.utils import calc_gc, count_motif, ref_id_to_name
+from telseq.utils import calc_gc, count_motif
 
 
-def _ensure_pysam() -> None:
-    """Ensure pysam is imported and available."""
-    global pysam, HAS_PYSAM
-    if pysam is not None:
-        return
+PreparedExomeBed = Dict[str, Tuple[List[int], List[Range]]]
+
+
+def _ensure_pysam() -> Any:
+    """Import pysam only when BAM scanning is requested."""
     try:
-        import pysam as pysam_module
-        pysam = pysam_module
-        HAS_PYSAM = True
-    except ImportError:
-        HAS_PYSAM = False
+        import pysam
+    except ImportError as exc:
         raise ImportError(
             "pysam is required for BAM file reading. "
             "Install it with: uv pip install pysam"
-        )
+        ) from exc
+
+    return pysam
 
 
 class Scanner:
-    """Scanner for BAM files."""
+    """Scan BAM files and calculate telomere-related read counts."""
 
     def __init__(
         self,
         bam_files: StringVector,
         exome_bed: Optional[Dict[str, List[Range]]] = None,
-        tel_k: int = TEL_MOTIF_CUTOFF,
-        read_length: int = 100,
-        pattern: str = PATTERN,
-        pattern_revcomp: str = PATTERN_REVCOMP,
+        tel_k: int = parameters.TEL_MOTIF_CUTOFF,
+        read_length: Optional[int] = None,
+        pattern: Optional[str] = None,
+        pattern_revcomp: Optional[str] = None,
         ignorerg: bool = False,
         writerheader: bool = True,
         mergerg: bool = False,
@@ -63,158 +44,338 @@ class Scanner:
     ) -> None:
         self.bam_files = bam_files
         self.exome_bed = exome_bed or {}
+
+        self.read_length = (
+            read_length
+            if read_length is not None
+            else parameters.READ_LENGTH
+        )
+        self.pattern = (
+            pattern
+            if pattern is not None
+            else parameters.PATTERN
+        )
+        self.pattern_revcomp = (
+            pattern_revcomp
+            if pattern_revcomp is not None
+            else parameters.PATTERN_REVCOMP
+        )
+
+        if self.read_length <= 0:
+            raise ValueError("Read length must be greater than zero.")
+
+        if not self.pattern:
+            raise ValueError("The motif pattern cannot be empty.")
+
+        if len(self.pattern) != len(self.pattern_revcomp):
+            raise ValueError(
+                "The motif and reverse-complement pattern must have "
+                "the same length."
+            )
+
+        self.pattern = self.pattern.upper()
+        self.pattern_revcomp = self.pattern_revcomp.upper()
+
+        self.tel_motif_n = (
+            self.read_length // len(self.pattern) + 1
+        )
+
         self.tel_k = tel_k
-        self.read_length = read_length
-        self.pattern = pattern
-        self.pattern_revcomp = pattern_revcomp
+
+        if not 1 <= self.tel_k < self.tel_motif_n:
+            raise ValueError(
+                f"k must be between 1 and {self.tel_motif_n - 1} "
+                f"for read length {self.read_length} and "
+                f"motif length {len(self.pattern)}."
+            )
+
         self.ignorerg = ignorerg
-        self.writerheader = writerheader
-        self.mergerg = mergerg
         self.onebam = onebam
 
+        # Kept for compatibility with the CLI.
+        # Output-specific behavior is handled in output.py.
+        self.writerheader = writerheader
+        self.mergerg = mergerg
+
+        self._exome_bed = self._prepare_exome_bed(self.exome_bed)
+
+    @staticmethod
+    def _prepare_exome_bed(
+        exome_bed: Dict[str, List[Range]],
+    ) -> PreparedExomeBed:
+        """Sort and merge exome intervals and cache their start positions."""
+        prepared: PreparedExomeBed = {}
+
+        for chromosome, ranges in exome_bed.items():
+            sorted_ranges = sorted(
+                ranges,
+                key=lambda interval: (
+                    interval.start,
+                    interval.end,
+                ),
+            )
+
+            merged: List[Range] = []
+
+            for interval in sorted_ranges:
+                if not merged or interval.start > merged[-1].end:
+                    merged.append(
+                        Range(
+                            start=interval.start,
+                            end=interval.end,
+                        )
+                    )
+                else:
+                    merged[-1].end = max(
+                        merged[-1].end,
+                        interval.end,
+                    )
+
+            starts = [interval.start for interval in merged]
+
+            prepared[chromosome] = (starts, merged)
+
+        return prepared
+
+    @staticmethod
+    def _new_result(
+        sample: str,
+        lib: str,
+        bam: str,
+        tel_motif_n: int,
+    ) -> ScanResults:
+        """Create a result with arrays sized for the active parameters."""
+        result = ScanResults(
+            sample=sample,
+            lib=lib,
+            bam=bam,
+        )
+
+        result.telcounts = [0] * tel_motif_n
+        result.gccounts = [0] * parameters.GC_BIN_N
+
+        return result
+
+    def _read_overlaps_exome(
+        self,
+        chromosome: str,
+        start: int,
+        end: int,
+    ) -> Optional[bool]:
+        """
+        Check whether a read overlaps an exome interval.
+
+        Returns:
+            True: read overlaps an exome interval.
+            False: chromosome exists in BED, but no overlap was found.
+            None: chromosome is absent from the BED.
+        """
+        chromosome_data = self._exome_bed.get(chromosome)
+
+        if chromosome_data is None:
+            return None
+
+        starts, intervals = chromosome_data
+
+        if not intervals:
+            return False
+
+        # Find the last interval starting before the read ends.
+        index = bisect_left(starts, end) - 1
+
+        if index < 0:
+            return False
+
+        interval = intervals[index]
+
+        # BED and pysam use zero-based, half-open coordinates.
+        return interval.end > start and interval.start < end
+
     def scan(self) -> List[Dict[str, ScanResults]]:
-        """Scan BAM files and return results."""
-        _ensure_pysam()
+        """Scan all BAM files and return results per BAM/read group."""
+        pysam = _ensure_pysam()
 
         resultlist: List[Dict[str, ScanResults]] = []
-        is_exome = bool(self.exome_bed)
+        is_exome = bool(self._exome_bed)
+        nprocessed = 0
 
-        print(f"{self.bam_files}\n{len(self.bam_files)} BAMs", file=sys.stderr)
+        print(self.bam_files)
+        print(f"{len(self.bam_files)} BAMs")
 
         for bam_path in self.bam_files:
             resultmap: Dict[str, ScanResults] = {}
-            lastfound: Dict[str, int] = {}
+            ntotal = 0
 
-            print(f"Start analysing BAM {bam_path}", file=sys.stderr)
+            print(
+                f"[scan] scanning BAM: {bam_path}",
+                file=sys.stderr,
+            )
 
-            # Open BAM file
-            bam_file = pysam.AlignmentFile(bam_path, "rb")
+            with pysam.AlignmentFile(bam_path, "rb") as bam_file:
+                header = bam_file.header.to_dict()
+                read_groups = header.get("RG", [])
 
-            # Get header
-            header = bam_file.header
-            rggroups = "RG" in header
+                # Ignore RG information completely when ignorerg is enabled.
+                rggroups = bool(read_groups) and not self.ignorerg
 
-            if self.ignorerg:
-                print("Treat all reads in BAM as if they were from a same sample", file=sys.stderr)
-                results = ScanResults(sample="UNKNOWN")
-                resultmap["UNKNOWN"] = results
-            else:
-                readgroups: Dict[str, str] = {}
-                readlibs: Dict[str, str] = {}
+                if self.ignorerg:
+                    resultmap["UNKNOWN"] = self._new_result(
+                        sample="UNKNOWN",
+                        lib="UNKNOWN",
+                        bam=bam_path,
+                        tel_motif_n=self.tel_motif_n,
+                    )
 
-                if rggroups:
-                    for read_group in header["RG"]:
-                        rg_id = read_group["ID"]
-                        readgroups[rg_id] = read_group.get("SM", "UNKNOWN")
-                        readlibs[rg_id] = read_group.get("LB", "UNKNOWN")
+                elif rggroups:
+                    for read_group in read_groups:
+                        rg_id = read_group.get("ID")
 
-                    print(f"Specified BAM has {len(readgroups)} read groups", file=sys.stderr)
+                        if not rg_id:
+                            continue
 
-                    for rg_id, sample in readgroups.items():
-                        results = ScanResults(sample=sample, lib=readlibs.get(rg_id, "UNKNOWN"))
-                        resultmap[rg_id] = results
+                        sample = read_group.get("SM", "UNKNOWN")
+                        library = read_group.get("LB", "UNKNOWN")
+
+                        resultmap[rg_id] = self._new_result(
+                            sample=sample,
+                            lib=library,
+                            bam=bam_path,
+                            tel_motif_n=self.tel_motif_n,
+                        )
+
                 else:
-                    print("Warning: can't find RG tag in the BAM header", file=sys.stderr)
-                    print("Warning: treat all reads in BAM as if they were from a same sample", file=sys.stderr)
-                    results = ScanResults(sample="UNKNOWN", lib="UNKNOWN")
-                    resultmap["UNKNOWN"] = results
+                    resultmap["UNKNOWN"] = self._new_result(
+                        sample="UNKNOWN",
+                        lib="UNKNOWN",
+                        bam=bam_path,
+                        tel_motif_n=self.tel_motif_n,
+                    )
 
-            # Process reads
-            nprocessed = 0  # Number of reads analyzed
-            ntotal = 0  # Number of reads scanned
+                for record in bam_file:
+                    ntotal += 1
 
-            for record in bam_file:
-                ntotal += 1
-                tag = "UNKNOWN"
+                    # Determine the read group.
+                    tag = "UNKNOWN"
 
-                if rggroups:
-                    # Skip reads without RG tag
-                    if not record.has_tag("RG"):
+                    if rggroups:
+                        if not record.has_tag("RG"):
+                            print(
+                                f"[scan] read without RG tag in {bam_path}",
+                                file=sys.stderr,
+                            )
+                            continue
+
+                        tag = record.get_tag("RG")
+
+                    if tag not in resultmap:
                         print(
-                            f"can't find RG tag for read at position "
-                            f"{record.reference_id}:{record.reference_start}",
+                            f"[scan] read group {tag!r} not found "
+                            f"in BAM header ({bam_path})",
                             file=sys.stderr,
                         )
-                        print("skip this read", file=sys.stderr)
                         continue
 
-                    # Get RG tag value
-                    tag = record.get_tag("RG")
+                    result = resultmap[tag]
 
-                # Skip reads with readgroup not defined in BAM header
-                if tag not in resultmap:
-                    print(
-                        f"RG tag {tag} for read at position {record.reference_id}:{record.reference_start} "
-                        "doesn't exist in BAM header.",
-                        file=sys.stderr,
-                    )
-                    continue
+                    # Exclude reads overlapping exome regions.
+                    if is_exome and not record.is_unmapped:
+                        chromosome = bam_file.get_reference_name(
+                            record.reference_id
+                        )
+                        start = record.reference_start
+                        end = record.reference_end
 
-                # For exome, exclude reads mapped to exome regions
-                if is_exome and record.reference_id != -1:
-                    chrm = ref_id_to_name(record.reference_id)
-                    if chrm != "-1":
-                        rg = Range(record.reference_start, record.reference_end)
-                        if chrm in self.exome_bed:
-                            ranges = self.exome_bed[chrm]
-                            # Check for overlap
-                            overlap_found = False
-                            for exome_range in ranges:
-                                if not (rg.end <= exome_range.start or rg.start >= exome_range.end):
-                                    overlap_found = True
-                                    break
-                            if overlap_found:
-                                resultmap[tag].n_exreadsExcluded += 1
+                        if (
+                            chromosome is not None
+                            and start >= 0
+                            and end is not None
+                        ):
+                            overlap = self._read_overlaps_exome(
+                                chromosome,
+                                start,
+                                end,
+                            )
+
+                            if overlap is True:
+                                result.n_exreadsExcluded += 1
                                 continue
-                        else:
-                            resultmap[tag].n_exreadsChrUnmatched += 1
 
-                resultmap[tag].numTotal += 1
+                            if overlap is None:
+                                result.n_exreadsChrUnmatched += 1
 
-                if record.is_mapped:
-                    resultmap[tag].numMapped += 1
+                    # Counters are incremented after exome filtering.
+                    result.numTotal += 1
 
-                if record.is_duplicate:
-                    resultmap[tag].numDuplicates += 1
+                    if not record.is_unmapped:
+                        result.numMapped += 1
 
-                # Get sequence
-                seq = record.query_sequence
-                if seq is None:
-                    continue
+                    if record.is_duplicate:
+                        result.numDuplicates += 1
 
-                gc = calc_gc(seq)
-                ptn_count = count_motif(seq, self.pattern, self.pattern_revcomp)
+                    sequence = record.query_sequence
 
-                # When the read length exceeds 100bp, number of patterns might exceed the boundary
-                if ptn_count > TEL_MOTIF_N - 1:
-                    continue
+                    if sequence is None:
+                        continue
 
-                resultmap[tag].telcounts[ptn_count] += 1
+                    sequence = sequence.upper()
 
-                if gc >= GC_LOWERBOUND and gc <= GC_UPPERBOUND:
-                    # Get index for GC bin
-                    idx = int((gc - GC_LOWERBOUND) / GC_BINSIZE)
-                    if idx < 0 or idx >= len(resultmap[tag].gccounts):
+                    gc = calc_gc(sequence)
+
+                    motif_count = count_motif(
+                        sequence,
+                        self.pattern,
+                        self.pattern_revcomp,
+                    )
+
+                    # Ignore reads whose motif count exceeds the
+                    # available motif-count bins.
+                    if motif_count >= self.tel_motif_n:
+                        continue
+
+                    result.telcounts[motif_count] += 1
+
+                    # Count GC content in the configured range.
+                    if (
+                        parameters.GC_LOWERBOUND
+                        <= gc
+                        <= parameters.GC_UPPERBOUND
+                    ):
+                        index = int(
+                            (gc - parameters.GC_LOWERBOUND)
+                            / parameters.GC_BINSIZE
+                        )
+
+                        # The upper GC boundary belongs to the final bin.
+                        index = min(
+                            index,
+                            len(result.gccounts) - 1,
+                        )
+
+                        if index < 0:
+                            raise ValueError(
+                                f"Invalid GC bin index: {index}"
+                            )
+
+                        result.gccounts[index] += 1
+
+                    nprocessed += 1
+
+                    if nprocessed % 10_000_000 == 0:
                         print(
-                            f"{nprocessed} GC:{gc} telcounts:{ptn_count} GC bin index out of bound: {idx}",
+                            f"[scan] processed {nprocessed} reads",
                             file=sys.stderr,
                         )
-                        # Clamp to valid range
-                        idx = max(0, min(idx, len(resultmap[tag].gccounts) - 1))
-                    resultmap[tag].gccounts[idx] += 1
 
-                nprocessed += 1
-
-                if nprocessed % 10000000 == 0:
-                    print(f"[scan] processed {nprocessed} reads\n", file=sys.stderr)
-
-            bam_file.close()
-
-            # Consider each BAM separately
             resultlist.append(resultmap)
 
-            print(f"[scan] total reads in BAM scanned {ntotal}", file=sys.stderr)
-            print("Completed scanning BAM", file=sys.stderr)
+            print(
+                f"[scan] total reads in BAM scanned: {ntotal}",
+                file=sys.stderr,
+            )
+            print(
+                "[scan] completed scanning BAM",
+                file=sys.stderr,
+            )
 
         if self.onebam:
             resultlist = self.merge_results_by_readgroup(resultlist)
@@ -222,9 +383,10 @@ class Scanner:
         return resultlist
 
     def merge_results_by_readgroup(
-        self, resultlist: List[Dict[str, ScanResults]]
+        self,
+        resultlist: List[Dict[str, ScanResults]],
     ) -> List[Dict[str, ScanResults]]:
-        """Merge results in result list into one."""
+        """Merge results from multiple BAMs by read-group ID."""
         mergedresults: Dict[str, ScanResults] = {}
 
         for resultmap in resultlist:
@@ -232,38 +394,73 @@ class Scanner:
                 if rg not in mergedresults:
                     mergedresults[rg] = result
                 else:
-                    self.add_results(mergedresults[rg], result)
+                    self.add_results(
+                        mergedresults[rg],
+                        result,
+                    )
 
         return [mergedresults]
 
-    def add_results(self, x: ScanResults, y: ScanResults) -> None:
-        """Combine counts in two ScanResults objects."""
+    @staticmethod
+    def add_results(
+        x: ScanResults,
+        y: ScanResults,
+    ) -> None:
+        """Add the counts from one ScanResults object to another."""
         x.numTotal += y.numTotal
         x.numMapped += y.numMapped
         x.numDuplicates += y.numDuplicates
+
+        x.n_totalunfiltered += y.n_totalunfiltered
         x.n_exreadsExcluded += y.n_exreadsExcluded
         x.n_exreadsChrUnmatched += y.n_exreadsChrUnmatched
-        x.n_totalunfiltered += y.n_totalunfiltered
 
-        for j in range(min(len(x.telcounts), len(y.telcounts))):
-            x.telcounts[j] += y.telcounts[j]
-        for k in range(min(len(x.gccounts), len(y.gccounts))):
-            x.gccounts[k] += y.gccounts[k]
+        if len(x.telcounts) != len(y.telcounts):
+            raise ValueError(
+                "Cannot merge results with different motif-bin sizes."
+            )
 
-    def calc_tel_length(self, results: ScanResults) -> float:
-        """Calculate telomere length from scan results."""
-        acc = 0
-        for i in range(self.tel_k, len(results.telcounts)):
-            acc += results.telcounts[i]
+        if len(x.gccounts) != len(y.gccounts):
+            raise ValueError(
+                "Cannot merge results with different GC-bin sizes."
+            )
 
-        gc_tel = 0
-        for i in range(len(results.gccounts)):
-            gc1 = GC_LOWERBOUND + GC_BINSIZE * i
-            gc2 = GC_LOWERBOUND + GC_BINSIZE * (i + 1)
-            if gc1 >= GC_TELOMERIC_LOWERBOUND and gc2 <= GC_TELOMERIC_UPPERBOUND:
-                gc_tel += results.gccounts[i]
+        for index in range(len(x.telcounts)):
+            x.telcounts[index] += y.telcounts[index]
 
-        if gc_tel == 0:
+        for index in range(len(x.gccounts)):
+            x.gccounts[index] += y.gccounts[index]
+
+    def calc_tel_length(self, result: ScanResults) -> float:
+        """Calculate the telomere length estimate for a read group."""
+        telomeric_reads = sum(
+            result.telcounts[self.tel_k :]
+        )
+
+        gc_telomeric_reads = 0
+
+        for index, count in enumerate(result.gccounts):
+            gc_start = (
+                parameters.GC_LOWERBOUND
+                + parameters.GC_BINSIZE * index
+            )
+            gc_end = (
+                parameters.GC_LOWERBOUND
+                + parameters.GC_BINSIZE * (index + 1)
+            )
+
+            if (
+                gc_start >= parameters.GC_TELOMERIC_LOWERBOUND
+                and gc_end <= parameters.GC_TELOMERIC_UPPERBOUND
+            ):
+                gc_telomeric_reads += count
+
+        if gc_telomeric_reads == 0:
             return -1
 
-        return (acc / gc_tel) * GENOME_LENGTH_AT_TEL_GC / LENGTH_UNIT / TELOMERE_ENDS
+        return (
+            (telomeric_reads / gc_telomeric_reads)
+            * parameters.GENOME_LENGTH_AT_TEL_GC
+            / parameters.LENGTH_UNIT
+            / parameters.TELOMERE_ENDS
+        )

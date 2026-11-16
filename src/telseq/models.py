@@ -1,9 +1,10 @@
+
 """Data models for TelSeq."""
 
 from dataclasses import dataclass, field
 from typing import List
 
-from telseq.parameters import GC_BIN_N, TEL_MOTIF_N
+from telseq import parameters
 
 
 @dataclass
@@ -13,8 +14,14 @@ class ScanResults:
     sample: str = ""
     lib: str = ""
     bam: str = ""
-    telcounts: List[int] = field(default_factory=lambda: [0] * TEL_MOTIF_N)
-    gccounts: List[int] = field(default_factory=lambda: [0] * GC_BIN_N)
+
+    telcounts: List[int] = field(
+        default_factory=lambda: [0] * parameters.TEL_MOTIF_N
+    )
+    gccounts: List[int] = field(
+        default_factory=lambda: [0] * parameters.GC_BIN_N
+    )
+
     numTotal: int = 0
     numMapped: int = 0
     numDuplicates: int = 0
@@ -27,20 +34,22 @@ class ScanResults:
 
     def set_defaults(self) -> None:
         """Initialize counts to zeros."""
-        self.telcounts = [0] * TEL_MOTIF_N
-        self.gccounts = [0] * GC_BIN_N
+        self.telcounts = [0] * parameters.TEL_MOTIF_N
+        self.gccounts = [0] * parameters.GC_BIN_N
+
         self.numTotal = 0
         self.numMapped = 0
         self.numDuplicates = 0
         self.telLenEstimate = 0.0
+
+        self.n_totalunfiltered = 0
         self.n_exreadsExcluded = 0
         self.n_exreadsChrUnmatched = 0
-        self.n_totalunfiltered = 0
 
 
 @dataclass
 class Range:
-    """A genomic range."""
+    """A genomic range using zero-based, half-open coordinates."""
 
     start: int
     end: int
