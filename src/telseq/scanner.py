@@ -129,18 +129,17 @@ class Scanner:
 
                 if rggroups:
                     # Skip reads without RG tag
-                    if "RG" not in record.tags:
+                    if not record.has_tag("RG"):
                         print(
-                            f"can't find RG tag for read at position {record.reference_id}:{record.reference_start}",
+                            f"can't find RG tag for read at position "
+                            f"{record.reference_id}:{record.reference_start}",
                             file=sys.stderr,
                         )
                         print("skip this read", file=sys.stderr)
                         continue
+
                     # Get RG tag value
-                    for rg_tag, rg_value in record.tags:
-                        if rg_tag == "RG":
-                            tag = rg_value
-                            break
+                    tag = record.get_tag("RG")
 
                 # Skip reads with readgroup not defined in BAM header
                 if tag not in resultmap:
